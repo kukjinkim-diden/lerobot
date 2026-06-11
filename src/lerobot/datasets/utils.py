@@ -26,7 +26,7 @@ import numpy as np
 import packaging.version
 import torch
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
-from huggingface_hub.errors import RevisionNotFoundError
+from huggingface_hub.errors import OfflineModeIsEnabled, RepositoryNotFoundError, RevisionNotFoundError
 
 from lerobot.utils.utils import flatten_dict, unflatten_dict
 
@@ -336,9 +336,13 @@ def get_repo_versions(repo_id: str, *, token: str | bool | None = None) -> list[
 
     Returns:
         list[packaging.version.Version]: A list of valid versions found.
+        Returns an empty list when offline or repo does not exist on Hub.
     """
     api = HfApi() if token is None else HfApi(token=token)
-    repo_refs = api.list_repo_refs(repo_id, repo_type="dataset")
+    try:
+        repo_refs = api.list_repo_refs(repo_id, repo_type="dataset")
+    except (OfflineModeIsEnabled, RepositoryNotFoundError):
+        return []
     repo_refs = [b.name for b in repo_refs.branches + repo_refs.tags]
     repo_versions = []
     for ref in repo_refs:
@@ -378,17 +382,11 @@ def get_safe_version(
     hub_versions = get_repo_versions(repo_id) if token is None else get_repo_versions(repo_id, token=token)
 
     if not hub_versions:
-        raise RevisionNotFoundError(
-            f"""Your dataset must be tagged with a codebase version.
-            Assuming _version_ is the codebase_version value in the info.json, you can run this:
-            ```python
-            from huggingface_hub import HfApi
-
-            hub_api = HfApi()
-            hub_api.create_tag("{repo_id}", tag="_version_", repo_type="dataset")
-            ```
-            """
+        # Hub unreachable (offline mode) or repo not yet published — use requested version as-is.
+        logging.debug(
+            "Hub not reachable or repo %s has no version tags; using local version %s", repo_id, version
         )
+        return f"v{target_version}"
 
     if target_version in hub_versions:
         return f"v{target_version}"
