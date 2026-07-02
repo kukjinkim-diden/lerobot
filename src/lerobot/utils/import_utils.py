@@ -72,7 +72,15 @@ def is_package_available(
 def get_safe_default_video_backend():
     logger = logging.getLogger(__name__)
     if importlib.util.find_spec("torchcodec"):
-        return "torchcodec"
+        try:
+            from torchcodec.decoders import VideoDecoder  # noqa: F401
+            return "torchcodec"
+        except Exception as e:
+            logger.warning(
+                f"'torchcodec' is installed but failed to load (likely missing FFmpeg shared libs): {e}. "
+                "Falling back to 'pyav'."
+            )
+            return "pyav"
     else:
         logger.warning(
             "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
