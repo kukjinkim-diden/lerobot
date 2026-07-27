@@ -285,10 +285,17 @@ def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[to
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
             items_dict[key] = [pil_to_chw_tensor(img) for img in items_dict[key]]
-        elif first_item is None or isinstance(first_item, dict):
+        elif isinstance(first_item, dict):
             pass
         else:
-            items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+            # None (arrow null, e.g. a nullable float column) must become a NaN
+            # tensor: passing None through crashes torch's default_collate.
+            items_dict[key] = [
+                x if isinstance(x, str)
+                else torch.tensor(float("nan")) if x is None
+                else torch.tensor(x)
+                for x in items_dict[key]
+            ]
     return items_dict
 
 
