@@ -84,8 +84,10 @@ dependencies = [
     "cmake>=3.29.0.1,<4.2.0",
     "setuptools>=71.0.0,<81.0.0",
     "rerun-sdk>=0.26.2",
-    "grpcio>=1.73.1",
-    "protobuf>=6.31.1",
+    # DIDEN gRPC stubs: didengui_pb2_grpc needs grpcio>=1.75.1, didengui_pb2
+    # gencode needs protobuf runtime >= 7.35
+    "grpcio>=1.75.1",
+    "protobuf>=7.35",
 ]
 
 # Optional dependencies
@@ -185,12 +187,10 @@ unitree_g1 = [
     "lerobot[matplotlib-dep]",
     "lerobot[pygame-dep]",
 ]
-# reachy2-sdk caps grpcio<=1.73.1 and protobuf<=6.32.0; quarantined here so downstream users aren't held back. reachy2-sdk is unlikely to release new versions.
-reachy2 = [
-    "reachy2_sdk>=1.0.15,<1.1.0",
-    "grpcio<=1.73.1",
-    "protobuf<=6.32.0",
-]
+# DIDEN local patch: reachy2 extra removed — reachy2_sdk pins protobuf<=6.32.0,
+# which conflicts with the DIDEN gRPC stubs (protobuf>=7.35) in the base deps,
+# and we don't use reachy2 hardware.
+# reachy2 = ["reachy2_sdk>=1.0.15,<1.1.0", "grpcio<=1.73.1", "protobuf<=6.32.0"]
 # Seeed Studio reBot B601-DM follower (motorbridge / CAN) + StarArm102 / reBot Arm 102
 # leader (motorbridge-smart-servo / FashionStar UART servos).
 rebot = ["lerobot[motorbridge-dep]", "lerobot[motorbridge-smart-servo-dep]"]
@@ -303,7 +303,7 @@ all = [
     "lerobot[hopejr]",
     "lerobot[lekiwi]",
     "lerobot[openarms]",
-    "lerobot[reachy2]",
+    # "lerobot[reachy2]",  # DIDEN local patch: reachy2_sdk pins protobuf<=6.32 vs DIDEN stubs >=7.35
     "lerobot[rebot]",
     "lerobot[kinematics]",
     "lerobot[intelrealsense]",
