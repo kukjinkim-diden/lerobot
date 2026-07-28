@@ -88,6 +88,8 @@ dependencies = [
     # gencode needs protobuf runtime >= 7.35
     "grpcio>=1.75.1",
     "protobuf>=7.35",
+    "pandas>=2.0.0,<3.0.0",
+    "lerobot[dataset]",
 ]
 
 # Optional dependencies
