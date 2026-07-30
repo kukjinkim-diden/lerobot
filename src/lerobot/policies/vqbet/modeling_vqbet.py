@@ -656,7 +656,13 @@ class VQBeTRgbEncoder(nn.Module):
 
     def __init__(self, config: VQBeTConfig):
         super().__init__()
-        # Set up optional preprocessing.
+        # Set up optional preprocessing: resize first, then crop (local patch — same
+        # order and semantics as DiffusionRgbEncoder's resize_shape).
+        if config.resize_shape is not None:
+            self.resize = torchvision.transforms.Resize(config.resize_shape)
+        else:
+            self.resize = None
+
         if config.crop_shape is not None:
             self.do_crop = True
             # Always use center crop for eval
@@ -693,7 +699,13 @@ class VQBeTRgbEncoder(nn.Module):
         # height and width from `config.image_features`.
 
         images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
+        # The dummy shape mirrors the runtime preprocessing order: resize -> crop.
+        if config.crop_shape is not None:
+            dummy_shape_h_w = config.crop_shape
+        elif config.resize_shape is not None:
+            dummy_shape_h_w = config.resize_shape
+        else:
+            dummy_shape_h_w = images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
@@ -709,7 +721,9 @@ class VQBeTRgbEncoder(nn.Module):
         Returns:
             (B, D) image feature.
         """
-        # Preprocess: maybe crop (if it was set up in the __init__).
+        # Preprocess: maybe resize, then maybe crop (if set up in the __init__).
+        if self.resize is not None:
+            x = self.resize(x)
         if self.do_crop:
             if self.training:  # noqa: SIM108
                 x = self.maybe_random_crop(x)

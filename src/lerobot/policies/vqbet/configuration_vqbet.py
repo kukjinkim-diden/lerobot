@@ -51,8 +51,18 @@ class VQBeTConfig(PreTrainedConfig):
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
         vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
+        resize_shape: (H, W) shape to resize images to as a preprocessing step for the vision
+            backbone, applied BEFORE any crop. If None, no resizing is done. Same semantics as the
+            local-patch `resize_shape` on DiffusionConfig: use it when the dataset's cameras record
+            at a higher resolution (e.g. 480x640) than the encoder needs, instead of cropping a
+            small window out of the full-size image.
+        crop_ratio: Ratio in (0, 1] used to derive the crop size from resize_shape
+            (crop_h = int(resize_shape[0] * crop_ratio), likewise for width).
+            Set to 1.0 to disable cropping. Only takes effect when resize_shape is not None.
         crop_shape: (H, W) shape to crop images to as a preprocessing step for the vision backbone. Must fit
-            within the image size. If None, no cropping is done.
+            within the image size (after resizing when resize_shape is set — in that case this field
+            is DERIVED from resize_shape and crop_ratio, and any explicit value is overwritten).
+            If None, no cropping is done.
         crop_is_random: Whether the crop should be random at training time (it's always a center crop in eval
             mode).
         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
@@ -95,6 +105,8 @@ class VQBeTConfig(PreTrainedConfig):
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    resize_shape: tuple[int, int] | None = None
+    crop_ratio: float = 1.0
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
@@ -137,6 +149,26 @@ class VQBeTConfig(PreTrainedConfig):
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
 
+        # resize -> crop preprocessing (mirrors the DiffusionConfig local patch).
+        if self.resize_shape is not None and (
+            len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
+        ):
+            raise ValueError(f"`resize_shape` must be a pair of positive integers. Got {self.resize_shape}.")
+        if not (0 < self.crop_ratio <= 1.0):
+            raise ValueError(f"`crop_ratio` must be in (0, 1]. Got {self.crop_ratio}.")
+        if self.resize_shape is not None:
+            if self.crop_ratio < 1.0:
+                self.crop_shape = (
+                    int(self.resize_shape[0] * self.crop_ratio),
+                    int(self.resize_shape[1] * self.crop_ratio),
+                )
+            else:
+                # Explicitly disable cropping for the resize path when crop_ratio == 1.0 —
+                # otherwise the (84, 84) default would silently crop the resized image.
+                self.crop_shape = None
+        if self.crop_shape is not None and (self.crop_shape[0] <= 0 or self.crop_shape[1] <= 0):
+            raise ValueError(f"`crop_shape` must have positive dimensions. Got {self.crop_shape}.")
+
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(
             lr=self.optimizer_lr,
@@ -157,7 +189,9 @@ class VQBeTConfig(PreTrainedConfig):
         if not len(self.image_features) == 1:
             raise ValueError("You must provide only one image among the inputs.")
 
-        if self.crop_shape is not None:
+        # With resize_shape the crop is derived from (and thus fits) the resized image;
+        # without it the crop must fit the raw camera frames.
+        if self.resize_shape is None and self.crop_shape is not None:
             for key, image_ft in self.image_features.items():
                 if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
                     raise ValueError(
