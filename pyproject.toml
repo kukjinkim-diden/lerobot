@@ -91,6 +91,7 @@ dependencies = [
     "pandas>=2.0.0,<3.0.0",
     "lerobot[dataset]",
     "lerobot[diffusion]",
+    "transformers>=5.5.4",
 ]
 
 # Optional dependencies
