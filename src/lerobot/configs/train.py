@@ -250,7 +250,21 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
         elif self.use_policy_training_preset and not self.resume:
             self.optimizer = active_cfg.get_optimizer_preset()
-            self.scheduler = active_cfg.get_scheduler_preset()
+            # An explicitly configured scheduler wins over the policy preset.
+            #
+            # Unconditionally assigning the preset here made `--scheduler.type=...`
+            # a no-op with no warning: ACT's get_scheduler_preset() returns None,
+            # so a requested warmup+cosine schedule silently became a constant LR
+            # and only showed up as a flat curve in the run's metrics.
+            #
+            # The alternative (use_policy_training_preset=false) does honour the
+            # CLI, but it also switches make_optimizer_and_scheduler to
+            # policy.parameters() instead of policy.get_optim_params() — which
+            # discards ACT's separate backbone param group, so
+            # optimizer_lr_backbone stops working. Overriding just the scheduler
+            # keeps the param groups and matches how every other CLI field behaves.
+            if self.scheduler is None:
+                self.scheduler = active_cfg.get_scheduler_preset()
 
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
