@@ -71,6 +71,30 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 
+def accumulate_loss_components(sums: dict[str, float], loss_dict: dict | None) -> dict[str, float]:
+    """Add the numeric entries of `loss_dict` into `sums`, in place.
+
+    Used to carry the eval loss's COMPONENTS alongside its total. The total is
+    policy.forward()'s loss, which for ACT is l1_loss + kl_weight * kld_loss — so
+    it is not comparable across runs that change kl_weight or use_vae: a smaller KL
+    coefficient shrinks the total by itself, making that run look like it
+    generalises better when its predictions did not change at all.
+
+    Non-numeric entries are skipped (a loss dict may carry diagnostics), and a
+    missing dict is tolerated — with use_vae=false ACT reports no kld_loss, so the
+    key set differs between runs and must not be assumed.
+    """
+    for k, v in (loss_dict or {}).items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            sums[k] = sums.get(k, 0.0) + float(v)
+    return sums
+
+
+def mean_loss_components(sums: dict[str, float], n: int) -> dict[str, float]:
+    """Average accumulated components and prefix them for the eval namespace."""
+    return {f"eval_{k}": v / max(n, 1) for k, v in sums.items()}
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -623,24 +647,39 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             policy.eval()
             eval_loss_sum = 0.0
             n_eval_batches = 0
+            # Also accumulate the COMPONENTS the policy reports, not just the total.
+            # eval_loss is policy.forward()'s total, which for ACT is
+            # l1_loss + kl_weight * kld_loss — so it is not comparable across runs
+            # that change kl_weight or use_vae: lowering the KL coefficient shrinks
+            # eval_loss on its own and makes that run look like it generalises
+            # better when nothing about its predictions changed. The per-component
+            # values are already in the loss dict; only the total was being kept.
+            eval_component_sums: dict[str, float] = {}
             with torch.no_grad(), accelerator.autocast():
                 for eval_batch in eval_dataloader:
                     for cam_key in dataset.meta.camera_keys:
                         if cam_key in eval_batch and eval_batch[cam_key].dtype == torch.uint8:
                             eval_batch[cam_key] = eval_batch[cam_key].to(dtype=torch.float32) / 255.0
                     eval_batch = preprocessor(eval_batch)
-                    loss, _ = policy.forward(eval_batch)
+                    loss, eval_loss_dict = policy.forward(eval_batch)
                     eval_loss_sum += loss.item()
+                    accumulate_loss_components(eval_component_sums, eval_loss_dict)
                     n_eval_batches += 1
+            eval_components = mean_loss_components(eval_component_sums, n_eval_batches)
             eval_loss = eval_loss_sum / max(n_eval_batches, 1)
             eval_loss = torch.tensor(eval_loss, device=device)
             eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
             policy.train()
 
             if is_main_process:
-                logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                # components on the same line as the total, so a text log is enough
+                # to compare runs whose loss composition differs
+                extra = "".join(f" {k}={v:.4f}" for k, v in sorted(eval_components.items()))
+                logging.info(f"step {step}: eval_loss={eval_loss:.4f}{extra}")
                 if wandb_logger:
-                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                    wandb_logger.log_dict(
+                        {"eval_loss": eval_loss, **eval_components}, step=step, mode="eval"
+                    )
 
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
