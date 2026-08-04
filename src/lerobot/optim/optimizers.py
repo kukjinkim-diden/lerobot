@@ -211,11 +211,16 @@ class _MuonWithAuxAdamW(torch.optim.Optimizer):
                 continue
             state = self.state[p]
             if "exp_avg" not in state:
-                state["step"] = 0
+                # a scalar TENSOR, exactly as torch.optim.AdamW keeps it: lerobot
+                # flattens optimizer state into a safetensors file at checkpoint
+                # time, and safetensors rejects python ints ("Key state/N/step is
+                # invalid, expected torch.Tensor") — which killed a run at its
+                # FIRST checkpoint, after training had run fine for 1000 steps.
+                state["step"] = torch.tensor(0.0)
                 state["exp_avg"] = torch.zeros_like(p)
                 state["exp_avg_sq"] = torch.zeros_like(p)
             state["step"] += 1
-            t = state["step"]
+            t = state["step"].item()
             exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
             exp_avg.lerp_(p.grad, 1 - beta1)
             exp_avg_sq.mul_(beta2).addcmul_(p.grad, p.grad, value=1 - beta2)

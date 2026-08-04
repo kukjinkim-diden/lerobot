@@ -146,3 +146,25 @@ def test_validate_honours_an_explicit_optimizer():
     )
     cfg2.validate()
     assert cfg2.optimizer is not None and cfg2.optimizer.type == "adamw"
+
+
+def test_optimizer_state_round_trips_through_lerobot_checkpointing(tmp_path):
+    """The failure this pins killed a real run at its FIRST checkpoint, after
+    training had run fine for 1000 steps: lerobot flattens optimizer state into
+    safetensors, which rejects python scalars — so AdamW-side `step` must be a
+    scalar tensor, exactly as torch.optim.AdamW keeps it. A plain step() test
+    can never catch this; only the save path does."""
+    from lerobot.optim.optimizers import load_optimizer_state, save_optimizer_state
+
+    w, bias = _param(8, 4), _param(4)
+    opt = MuonConfig().build([w, bias])
+    opt.step()
+    save_optimizer_state(opt, tmp_path)          # raised ValueError before the fix
+
+    w2, bias2 = _param(8, 4), _param(4)
+    opt2 = MuonConfig().build([w2, bias2])
+    opt2 = load_optimizer_state(opt2, tmp_path)
+    steps = [s["step"] for s in opt2.state.values() if "step" in s]
+    assert steps and all(torch.is_tensor(s) and s.item() == 1.0 for s in steps)
+    bufs = [s for s in opt2.state.values() if "momentum_buffer" in s]
+    assert bufs, "muon momentum buffer did not survive the round trip"
