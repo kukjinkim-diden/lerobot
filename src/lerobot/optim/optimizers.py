@@ -127,6 +127,167 @@ class SGDConfig(OptimizerConfig):
         return torch.optim.SGD(params, **kwargs)
 
 
+def _zeropower_via_newtonschulz5(g: torch.Tensor, steps: int) -> torch.Tensor:
+    """Approximately orthogonalize `g` via a quintic Newton-Schulz iteration.
+
+    This is the core of Muon (Jordan et al., "Muon: MomentUm Orthogonalized by
+    Newton-schulz"): replace the momentum-averaged gradient of a 2D weight with
+    the nearest (semi-)orthogonal matrix, so every singular direction takes a
+    same-sized step instead of the largest ones dominating. The quintic
+    coefficients maximise convergence speed at zero; they do NOT converge all
+    singular values exactly to 1, but into a band around it — which is why the
+    tests below assert a band, not identity. Runs in bfloat16: the iteration is
+    stable there and matmuls are what the whole cost is.
+    """
+    if g.ndim != 2:
+        raise ValueError(f"Newton-Schulz expects a 2D tensor, got shape {tuple(g.shape)}")
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    x = g.to(torch.bfloat16)
+    transposed = g.size(0) > g.size(1)
+    if transposed:  # iterate on the wide orientation: X @ X.T is the smaller square
+        x = x.mT
+    x = x / (x.norm() + 1e-7)  # spectral norm <= frobenius norm -> singular values <= 1
+    for _ in range(steps):
+        xxt = x @ x.mT
+        x = a * x + (b * xxt + c * xxt @ xxt) @ x
+    if transposed:
+        x = x.mT
+    return x.to(g.dtype)
+
+
+class _MuonWithAuxAdamW(torch.optim.Optimizer):
+    """Muon for matrix-shaped weights, AdamW for everything else, in ONE optimizer.
+
+    One optimizer rather than two because the training loop, the LR scheduler and
+    checkpointing all hold a single optimizer object. Each param group carries a
+    `use_muon` flag; build() below decides membership by tensor shape (ndim >= 2
+    -> Muon, flattening conv kernels to 2D as the reference implementation does;
+    biases/norm gains -> AdamW).
+    """
+
+    def __init__(self, groups: list[dict], defaults: dict):
+        super().__init__(groups, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):  # noqa: D102
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            if group["use_muon"]:
+                self._muon_group(group)
+            else:
+                self._adamw_group(group)
+        return loss
+
+    def _muon_group(self, group: dict) -> None:
+        lr, momentum, wd, ns_steps = (
+            group["lr"], group["momentum"], group["weight_decay"], group["ns_steps"])
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            g = p.grad
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(g)
+            buf = state["momentum_buffer"]
+            buf.mul_(momentum).add_(g)
+            g = g.add(buf, alpha=momentum) if group["nesterov"] else buf
+            g2d = g if g.ndim == 2 else g.view(g.size(0), -1)  # conv -> (out, in*k*k)
+            update = _zeropower_via_newtonschulz5(g2d, ns_steps)
+            # scale so the update RMS is shape-independent (reference Muon):
+            # tall matrices otherwise take relatively smaller steps
+            update = update * max(1.0, g2d.size(0) / g2d.size(1)) ** 0.5
+            if wd:
+                p.mul_(1.0 - lr * wd)
+            p.add_(update.view_as(p), alpha=-lr)
+
+    def _adamw_group(self, group: dict) -> None:
+        lr, wd, eps = group["lr"], group["weight_decay"], group["eps"]
+        beta1, beta2 = group["betas"]
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if "exp_avg" not in state:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(p)
+                state["exp_avg_sq"] = torch.zeros_like(p)
+            state["step"] += 1
+            t = state["step"]
+            exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+            exp_avg.lerp_(p.grad, 1 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(p.grad, p.grad, value=1 - beta2)
+            step_size = lr * (1 - beta2**t) ** 0.5 / (1 - beta1**t)
+            if wd:
+                p.mul_(1.0 - lr * wd)
+            p.addcdiv_(exp_avg, exp_avg_sq.sqrt().add_(eps), value=-step_size)
+
+
+@OptimizerConfig.register_subclass("muon")
+@dataclass
+class MuonConfig(OptimizerConfig):
+    """Muon (orthogonalized momentum) for 2D+ weights, AdamW for the rest.
+
+    `lr` is the MUON learning rate and lives on a different scale from AdamW's
+    (reference default 0.02, vs 1e-4-ish for AdamW) because the update is an
+    orthogonalized (unit-scale) matrix, not a raw gradient. `adamw_lr` drives the
+    non-matrix parameters (biases, norm gains).
+
+    Param groups that arrive with their own "lr" (ACT's get_optim_params gives the
+    ResNet backbone one, fed by --policy.optimizer_lr_backbone) keep it — for BOTH
+    halves of that group. A pretrained backbone at the full Muon rate is exactly
+    the thing one wants to be able to slow down, and this preserves that knob.
+
+    Known ceiling: membership is decided by tensor SHAPE, so 2D embedding tables
+    (ACT's learned position embeddings) land in Muon, where the reference
+    guidance would put them in AdamW. They are a tiny fraction of ACT's
+    parameters; revisit if a policy with large embedding tables adopts this.
+    """
+
+    lr: float = 0.02
+    weight_decay: float = 1e-4
+    grad_clip_norm: float = 10.0
+    momentum: float = 0.95
+    nesterov: bool = True
+    ns_steps: int = 5
+    adamw_lr: float = 3e-4
+    adamw_betas: tuple[float, float] = (0.9, 0.999)
+    adamw_eps: float = 1e-8
+
+    def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
+        # normalise the accepted shapes (see OptimizerParams) into param groups
+        params = list(params)
+        incoming: list[dict]
+        if params and isinstance(params[0], dict) and "params" in params[0]:
+            incoming = params  # already param groups (ACT, VQBeT)
+        else:
+            incoming = [{"params": params}]
+
+        groups: list[dict] = []
+        for grp in incoming:
+            plist = list(grp["params"])
+            group_lr = grp.get("lr")  # e.g. ACT's backbone lr — keep it if present
+            matrix = [p for p in plist if p.ndim >= 2]
+            other = [p for p in plist if p.ndim < 2]
+            if matrix:
+                groups.append({
+                    "params": matrix, "use_muon": True,
+                    "lr": group_lr if group_lr is not None else self.lr,
+                    "momentum": self.momentum, "nesterov": self.nesterov,
+                    "ns_steps": self.ns_steps, "weight_decay": self.weight_decay,
+                })
+            if other:
+                groups.append({
+                    "params": other, "use_muon": False,
+                    "lr": group_lr if group_lr is not None else self.adamw_lr,
+                    "betas": self.adamw_betas, "eps": self.adamw_eps,
+                    "weight_decay": self.weight_decay,
+                })
+        return _MuonWithAuxAdamW(groups, defaults={})
+
+
 @OptimizerConfig.register_subclass("xvla-adamw")
 @dataclass
 class XVLAAdamWConfig(OptimizerConfig):
