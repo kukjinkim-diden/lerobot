@@ -358,6 +358,13 @@ class ACT(nn.Module):
             n_1d_tokens += 1
         if self.config.env_state_feature:
             n_1d_tokens += 1
+        if self.config.n_task_embeddings:
+            # one token per task index (multi-task conditioning). A token rather
+            # than FiLM/addition: it reuses the encoder's existing attention over
+            # 1d tokens, so with n_task_embeddings=None NOTHING about the original
+            # architecture changes — old checkpoints load untouched.
+            self.encoder_task_embed = nn.Embedding(config.n_task_embeddings, config.dim_model)
+            n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
@@ -466,6 +473,24 @@ class ACT(nn.Module):
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+        # Task token (multi-task conditioning).
+        if self.config.n_task_embeddings:
+            if "task_index" not in batch:
+                raise KeyError(
+                    "n_task_embeddings is set but the batch has no 'task_index'. "
+                    "Training batches carry it automatically; at inference the "
+                    "caller must supply the task's index IN THE TRAINING DATASET'S "
+                    "tasks table (not the sim's task id)."
+                )
+            task_idx = batch["task_index"].long().reshape(-1)
+            if torch.any(task_idx >= self.config.n_task_embeddings) or torch.any(task_idx < 0):
+                # an nn.Embedding overflow on CUDA is a device-side assert with no
+                # useful message; fail here with the numbers instead
+                raise ValueError(
+                    f"task_index {task_idx.tolist()} out of range for "
+                    f"n_task_embeddings={self.config.n_task_embeddings}"
+                )
+            encoder_in_tokens.append(self.encoder_task_embed(task_idx))
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.

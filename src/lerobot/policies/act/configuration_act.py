@@ -123,6 +123,18 @@ class ACTConfig(PreTrainedConfig):
     kl_weight: float = 10.0
 
     # Training preset
+    # Multi-task conditioning by dataset task index. None (default) = the original
+    # single-task ACT: batches may carry task_index and it is ignored. Set to the
+    # number of tasks (e.g. 10 for the press-button set) to add ONE learned
+    # embedding token to the transformer encoder, looked up from batch["task_index"].
+    # Index-based rather than language-based deliberately: the task set is closed,
+    # the dataloader already delivers task_index with every frame, and 10 x
+    # dim_model parameters cost nothing at ~56 episodes per task. The mapping
+    # index<->task string is defined by the TRAINING dataset's tasks table, so
+    # evaluation must resolve its task through that same table (see the Isaac
+    # runner), or the model is silently conditioned on the wrong task.
+    n_task_embeddings: int | None = None
+
     optimizer_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
