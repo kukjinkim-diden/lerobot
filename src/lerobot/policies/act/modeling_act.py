@@ -323,15 +323,40 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            # Frozen BN is only meaningful over PRETRAINED running stats; with a
+            # random init it is an identity op, i.e. a ResNet without any
+            # normalization — a silent trap for from-scratch runs. norm_layer=None
+            # is torchvision's default (regular, trainable BatchNorm2d).
+            norm_layer = FrozenBatchNorm2d if config.pretrained_backbone_weights else None
+
+            def build_backbone():
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[
+                        False,
+                        False,
+                        config.replace_final_stride_with_dilation,
+                    ],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=norm_layer,
+                )
+                # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the
+                # final feature map).
+                # Note: The forward method of this returns a dict: {"feature_map": output}.
+                return backbone_model, IntermediateLayerGetter(
+                    backbone_model, return_layers={"layer4": "feature_map"}
+                )
+
+            if config.separate_vision_encoders:
+                # One backbone per camera (original Zhao et al. ACT). Named
+                # `backbones` — the "model.backbone" prefix match in
+                # get_optim_params still catches it, so optimizer_lr_backbone
+                # applies to every copy.
+                backbone_model, first = build_backbone()
+                self.backbones = nn.ModuleList(
+                    [first] + [build_backbone()[1] for _ in range(len(self.config.image_features) - 1)]
+                )
+            else:
+                backbone_model, self.backbone = build_backbone()
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -496,8 +521,15 @@ class ACT(nn.Module):
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
+            # batch[OBS_IMAGES] is built as [batch[k] for k in config.image_features]
+            # (see ACTPolicy.forward), the same order self.backbones was built in —
+            # strict zip fails loudly if the camera count ever drifts.
+            if self.config.separate_vision_encoders:
+                backbones = list(self.backbones)
+            else:
+                backbones = [self.backbone] * len(batch[OBS_IMAGES])
+            for img, backbone in zip(batch[OBS_IMAGES], backbones, strict=True):
+                cam_features = backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 

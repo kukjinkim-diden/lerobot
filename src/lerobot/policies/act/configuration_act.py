@@ -97,6 +97,15 @@ class ACTConfig(PreTrainedConfig):
     # Vision backbone.
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    # One backbone PER CAMERA (the original Zhao et al. ACT layout) instead of
+    # lerobot's single backbone shared across all cameras. False (default) keeps
+    # the original architecture and checkpoint layout byte-identical.
+    # NOTE on scratch training: when pretrained_backbone_weights is None the
+    # backbone norm layer switches from FrozenBatchNorm2d to regular BatchNorm2d —
+    # frozen BN with random init is an IDENTITY (mean 0, var 1, weight 1, bias 0),
+    # i.e. a ResNet with no normalization at all, which is a silent trap for any
+    # from-scratch run. Frozen BN only makes sense over pretrained running stats.
+    separate_vision_encoders: bool = False
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
     pre_norm: bool = False
