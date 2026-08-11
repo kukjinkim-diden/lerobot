@@ -25,6 +25,7 @@ References:
 - https://brysonkjones.substack.com/p/dissecting-and-open-sourcing-multitask-diffusion-transformer-policy
 """
 
+import logging
 import math
 from collections import deque
 from typing import TYPE_CHECKING
@@ -64,6 +65,8 @@ from lerobot.utils.constants import (
 from ..pretrained import PreTrainedPolicy
 from ..utils import populate_queues
 
+logger = logging.getLogger(__name__)
+
 # -- Policy --
 
 
@@ -101,8 +104,19 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
                 horizon=horizon,
                 do_mask_loss_for_padding=config.do_mask_loss_for_padding,
             )
+        elif config.is_streaming_flow:
+            self.objective = StreamingFlowObjective(
+                config,
+                action_dim=action_dim,
+                horizon=horizon,
+                do_mask_loss_for_padding=config.do_mask_loss_for_padding,
+            )
         else:
             raise ValueError(f"Unsupported objective: {config.objective}")
+
+        # streaming_flow only: last executed (normalized) action — the flow start
+        # point a(0) of the next chunk.
+        self._last_executed_action: Tensor | None = None
 
         self.reset()
 
@@ -128,11 +142,49 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
             },
         ]
 
+    def _flow_start_point(self, batch: dict[str, Tensor]) -> Tensor:
+        """streaming_flow only — a(0) for the next chunk: last executed action, else a bootstrap."""
+        state = batch[OBS_STATE]  # (B, n_obs_steps, state_dim)
+        batch_size = state.shape[0]
+        action_dim = self.config.action_feature.shape[0]
+
+        if (
+            self._last_executed_action is not None
+            and self._last_executed_action.shape[0] == batch_size
+        ):
+            return self._last_executed_action
+
+        if self.config.sfp_a0_from_state_indices is not None:
+            idx = torch.as_tensor(self.config.sfp_a0_from_state_indices, device=state.device)
+            a0 = state[:, -1, :].index_select(-1, idx)
+            logger.debug(
+                "[multi_task_dit/streaming_flow] episode-start a(0) bootstrapped from state indices %s",
+                self.config.sfp_a0_from_state_indices,
+            )
+            return a0
+
+        logger.debug(
+            "[multi_task_dit/streaming_flow] episode-start a(0) fallback to zeros "
+            "(no sfp_a0_from_state_indices configured)"
+        )
+        return torch.zeros(batch_size, action_dim, dtype=state.dtype, device=state.device)
+
     def _generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
 
         conditioning_vec = self.observation_encoder.encode(batch)
+
+        if self.config.is_streaming_flow:
+            # The ODE integrates from a(0); its states at the action-grid times ARE
+            # the executed actions, so no chunk slicing is involved. The chunk's
+            # last action is executed right before the next chunk is generated,
+            # making it the next chunk's flow start point.
+            a0 = self._flow_start_point(batch)
+            actions = self.objective.sample_actions(self.noise_predictor, a0, conditioning_vec)
+            self._last_executed_action = actions[:, -1].detach().clone()
+            return actions
+
         actions = self.objective.conditional_sample(self.noise_predictor, batch_size, conditioning_vec)
 
         start = n_obs_steps - 1
@@ -149,6 +201,8 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
+
+        self._last_executed_action = None
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
@@ -812,3 +866,131 @@ class FlowMatchingObjective(nn.Module):
             x = x + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
 
         return x
+
+
+class StreamingFlowObjective(nn.Module):
+    """Streaming Flow Policy objective (SFP-S, the stochastic variant).
+
+    Paper: "Streaming Flow Policy: Simplifying diffusion/flow-matching policies by
+    treating action trajectories as flow trajectories" (https://arxiv.org/abs/2505.21851).
+
+    Unlike FlowMatchingObjective — where the flow carries noise to a whole action
+    chunk in denoising time and intermediate ODE states are meaningless — here the
+    flow runs along the action trajectory itself. The demonstration chunk xi (a
+    uniform grid of `horizon` actions over flow-time t in [0, 1]) defines:
+
+        a(t) = xi(t) + eps0 + sigma_r * t * z0      eps0 ~ N(0, sigma_0), z0 ~ N(0, 1)
+        z(t) = (1 - (1 - sigma_1) t) z0 + t xi(t)
+        va(t) = xi'(t) + sigma_r * z0
+        vz(t) = xi(t) + t xi'(t) - (1 - sigma_1) z0
+
+    with sigma_r = sqrt(sigma_1^2 - sigma_0^2). The DiT acts as the velocity net
+    over the fixed length-2 token pair [a; z] (timestep = flow time in [0, 1]),
+    which its RoPE/positional handling supports unchanged. At inference the ODE
+    integrates from a(0) = the last executed action, z(0) ~ N(0, 1); the states at
+    the action-grid times ARE the actions (the "streaming" property), and language
+    conditioning rides in via `conditioning_vec` exactly as for the other objectives.
+    """
+
+    def __init__(self, config, action_dim: int, horizon: int, do_mask_loss_for_padding: bool = False):
+        super().__init__()
+        self.config = config
+        self.action_dim = action_dim
+        self.horizon = horizon
+        self.do_mask_loss_for_padding = do_mask_loss_for_padding
+
+        sigma_r = (config.sfp_sigma_1**2 - config.sfp_sigma_0**2) ** 0.5
+        self.register_buffer("sigma_r", torch.tensor(sigma_r, dtype=torch.float32))
+
+        logger.debug(
+            "[multi_task_dit/streaming_flow] horizon=%d n_action_steps=%d sigma_0=%.3f sigma_1=%.3f "
+            "integration=%s x%d",
+            horizon,
+            config.n_action_steps,
+            config.sfp_sigma_0,
+            config.sfp_sigma_1,
+            config.integration_method,
+            config.sfp_integration_steps_per_action,
+        )
+
+    def compute_loss(self, model: nn.Module, batch: dict[str, Tensor], conditioning_vec: Tensor) -> Tensor:
+        actions = batch[ACTION]  # (B, horizon, action_dim), normalized
+        batch_size, horizon, _ = actions.shape
+        assert horizon == self.horizon
+        device = actions.device
+
+        sigma_0 = self.config.sfp_sigma_0
+        sigma_1 = self.config.sfp_sigma_1
+
+        # Sample one flow time per batch element and linearly interpolate the
+        # demonstration trajectory xi on the uniform action grid (first-order hold).
+        t = torch.rand(batch_size, device=device)  # (B,)
+        pos = t * (horizon - 1)
+        idx = pos.floor().long().clamp(max=horizon - 2)  # (B,)
+        frac = (pos - idx.to(pos.dtype)).unsqueeze(-1)  # (B, 1)
+        batch_arange = torch.arange(batch_size, device=device)
+        a_lo = actions[batch_arange, idx]  # (B, action_dim)
+        a_hi = actions[batch_arange, idx + 1]  # (B, action_dim)
+        xi = a_lo + frac * (a_hi - a_lo)  # xi(t)
+        dxi = (a_hi - a_lo) * (horizon - 1)  # xi'(t)
+
+        t_col = t.unsqueeze(-1)  # (B, 1)
+        z0 = torch.randn_like(xi)
+        a_t = xi + sigma_0 * torch.randn_like(xi) + self.sigma_r * t_col * z0
+        z_t = (1 - (1 - sigma_1) * t_col) * z0 + t_col * xi
+        va = dxi + self.sigma_r * z0
+        vz = xi + t_col * dxi - (1 - sigma_1) * z0
+
+        x = torch.stack((a_t, z_t), dim=1)  # (B, 2, action_dim)
+        v_target = torch.stack((va, vz), dim=1)  # (B, 2, action_dim)
+
+        v_pred = model(x, t, conditioning_vec=conditioning_vec)  # (B, 2, action_dim)
+        loss = F.mse_loss(v_pred, v_target, reduction="none")
+
+        # Down-weight samples whose interpolation segment lies in copy-padded
+        # actions (episode ends).
+        if self.do_mask_loss_for_padding and "action_is_pad" in batch:
+            in_bounds = ~batch["action_is_pad"]  # (B, horizon)
+            valid = (in_bounds[batch_arange, idx] & in_bounds[batch_arange, idx + 1]).float()
+            mask = valid.view(batch_size, 1, 1)
+            return (loss * mask).sum() / (mask.sum() * loss.shape[1] * loss.shape[2]).clamp_min(1)
+
+        return loss.mean()
+
+    def sample_actions(self, model: nn.Module, a0: Tensor, conditioning_vec: Tensor) -> Tensor:
+        """
+        Integrate the velocity field from a(0)=`a0` (B, action_dim), z(0)~N(0,1) and
+        return the states at action-grid times: (B, n_action_steps, action_dim).
+        Grid index 0 is a(0) itself; executed actions are grid indices 1..n_action_steps.
+        """
+        z0 = torch.randn_like(a0)
+        x = torch.stack((a0, z0), dim=1)  # (B, 2, action_dim)
+        batch_size = a0.shape[0]
+
+        n_sub = self.config.sfp_integration_steps_per_action
+        dt = (1.0 / (self.horizon - 1)) / n_sub
+        method = self.config.integration_method
+
+        def dynamics(x_val: Tensor, t_scalar: float) -> Tensor:
+            t_batch = torch.full((batch_size,), t_scalar, dtype=x_val.dtype, device=x_val.device)
+            with torch.no_grad():
+                return model(x_val, t_batch, conditioning_vec=conditioning_vec)
+
+        actions = []
+        t = 0.0
+        for _ in range(self.config.n_action_steps):
+            for _ in range(n_sub):
+                if method == "euler":
+                    x = x + dt * dynamics(x, t)
+                elif method == "rk4":
+                    k1 = dynamics(x, t)
+                    k2 = dynamics(x + dt * k1 / 2, t + dt / 2)
+                    k3 = dynamics(x + dt * k2 / 2, t + dt / 2)
+                    k4 = dynamics(x + dt * k3, t + dt)
+                    x = x + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+                else:
+                    raise ValueError(f"Unknown integration method: {method}")
+                t += dt
+            actions.append(x[:, 0, :])
+
+        return torch.stack(actions, dim=1)  # (B, n_action_steps, action_dim)

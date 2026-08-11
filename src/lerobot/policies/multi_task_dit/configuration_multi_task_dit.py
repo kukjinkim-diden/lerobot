@@ -35,7 +35,7 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     n_action_steps: int = 24  # Actions executed per policy call (~0.8s at 30Hz)
 
     # Objective Selection
-    objective: str = "diffusion"  # "diffusion" or "flow_matching"
+    objective: str = "diffusion"  # "diffusion", "flow_matching" or "streaming_flow"
 
     # --- Diffusion-specific (used when objective="diffusion") ---
     noise_scheduler_type: str = "DDPM"  # "DDPM" or "DDIM"
@@ -57,6 +57,20 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     timestep_sampling_s: float = 0.999  # (beta only) Max timestep threshold
     timestep_sampling_alpha: float = 1.5  # (beta only) Beta distribution alpha
     timestep_sampling_beta: float = 1.0  # (beta only) Beta distribution beta
+
+    # --- Streaming Flow-specific (used when objective="streaming_flow") ---
+    # SFP-S (arXiv:2505.21851): unlike "flow_matching" (noise -> action chunk in
+    # denoising time), the flow runs along the ACTION TRAJECTORY itself, starting
+    # at a(0) = the last executed action; ODE states at action-grid times ARE the
+    # actions. The DiT acts as the velocity net over the length-2 token pair
+    # [a; z]. Integration reuses `integration_method` above. See the standalone
+    # policies/streaming_flow for the single-task, non-language variant.
+    sfp_sigma_0: float = 0.1  # conditional flow std at t=0 (0 <= sigma_0 <= sigma_1)
+    sfp_sigma_1: float = 0.1  # conditional flow std at t=1
+    sfp_integration_steps_per_action: int = 3  # ODE substeps per action step at inference
+    # Episode-start a(0) bootstrap: index into observation.state per action dim
+    # (commanded == measured at rest). None -> zeros (mid-range under MIN_MAX).
+    sfp_a0_from_state_indices: tuple[int, ...] | None = None
 
     # Transformer Architecture
     hidden_dim: int = 512  # Transformer hidden dimension
@@ -115,8 +129,11 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     def _validate(self):
         """Validate configuration parameters."""
         # Objective validation
-        if self.objective not in ["diffusion", "flow_matching"]:
-            raise ValueError(f"objective must be 'diffusion' or 'flow_matching', got '{self.objective}'")
+        if self.objective not in ["diffusion", "flow_matching", "streaming_flow"]:
+            raise ValueError(
+                f"objective must be 'diffusion', 'flow_matching' or 'streaming_flow', "
+                f"got '{self.objective}'"
+            )
 
         # Transformer validation
         if self.hidden_dim <= 0:
@@ -188,6 +205,31 @@ class MultiTaskDiTConfig(PreTrainedConfig):
                 if self.timestep_sampling_beta <= 0:
                     raise ValueError("timestep_sampling_beta must be positive")
 
+        elif self.objective == "streaming_flow":
+            if not (0 <= self.sfp_sigma_0 <= self.sfp_sigma_1):
+                raise ValueError(
+                    f"Need 0 <= sfp_sigma_0 <= sfp_sigma_1. "
+                    f"Got {self.sfp_sigma_0=}, {self.sfp_sigma_1=}."
+                )
+            if self.integration_method not in ["euler", "rk4"]:
+                raise ValueError(
+                    f"integration_method must be 'euler' or 'rk4', got {self.integration_method}"
+                )
+            if self.sfp_integration_steps_per_action < 1:
+                raise ValueError("sfp_integration_steps_per_action must be >= 1")
+            if self.horizon < 2:
+                raise ValueError(f"horizon must be >= 2 to define a trajectory, got {self.horizon}")
+            # Grid index 0 is a(0) (the last executed action), so with n_obs_steps=2
+            # the action grid starts one step in the past and training/inference
+            # align exactly. Other obs horizons break that alignment.
+            if self.n_obs_steps != 2:
+                raise ValueError(f"objective='streaming_flow' requires n_obs_steps=2, got {self.n_obs_steps}")
+            if not (1 <= self.n_action_steps <= self.horizon - self.n_obs_steps + 1):
+                raise ValueError(
+                    f"Need 1 <= n_action_steps <= horizon - n_obs_steps + 1. "
+                    f"Got {self.n_action_steps=}, {self.horizon=}, {self.n_obs_steps=}."
+                )
+
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(
             lr=self.optimizer_lr,
@@ -233,6 +275,20 @@ class MultiTaskDiTConfig(PreTrainedConfig):
                         f"Image '{key}' shape {image_ft.shape} != '{first_key}' shape {first_ft.shape}"
                     )
 
+        if self.is_streaming_flow and self.sfp_a0_from_state_indices is not None:
+            action_dim = self.action_feature.shape[0]
+            state_dim = self.robot_state_feature.shape[0]
+            if len(self.sfp_a0_from_state_indices) != action_dim:
+                raise ValueError(
+                    f"`sfp_a0_from_state_indices` must have one index per action dim ({action_dim}). "
+                    f"Got {len(self.sfp_a0_from_state_indices)}."
+                )
+            if any(not (0 <= i < state_dim) for i in self.sfp_a0_from_state_indices):
+                raise ValueError(
+                    f"`sfp_a0_from_state_indices` entries must be valid observation.state indices "
+                    f"(state_dim={state_dim}). Got {self.sfp_a0_from_state_indices}."
+                )
+
     @property
     def is_diffusion(self) -> bool:
         return self.objective == "diffusion"
@@ -240,6 +296,10 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     @property
     def is_flow_matching(self) -> bool:
         return self.objective == "flow_matching"
+
+    @property
+    def is_streaming_flow(self) -> bool:
+        return self.objective == "streaming_flow"
 
     @property
     def observation_delta_indices(self) -> list:
