@@ -287,7 +287,15 @@ class ObservationEncoder(nn.Module):
             self.robot_state_dim = 0
 
         self.text_dim = config.hidden_dim
-        self.text_encoder = CLIPTextEncoder(model_name=config.text_encoder_name, projection_dim=self.text_dim)
+        if config.conditioning_mode == "task_index":
+            # learned per-task embedding instead of a CLIP text encoder — same
+            # conditioning-vector slot size (self.text_dim) so _setup_vector_output's
+            # total_dim math is identical in both modes.
+            self.text_encoder = None
+            self.task_embed = nn.Embedding(config.n_tasks, self.text_dim)
+        else:
+            self.text_encoder = CLIPTextEncoder(model_name=config.text_encoder_name, projection_dim=self.text_dim)
+            self.task_embed = None
 
         self._setup_vector_output()
 
@@ -378,6 +386,23 @@ class ObservationEncoder(nn.Module):
 
             text_features = text_features.unsqueeze(1).expand(-1, n_obs_steps, -1)
             conditioning_feats.append(text_features)
+        elif self.config.conditioning_mode == "task_index":
+            if "task_index" not in batch:
+                raise KeyError(
+                    "conditioning_mode is 'task_index' but the batch has no 'task_index'. "
+                    "Training batches carry it automatically; at inference the caller must "
+                    "supply the task's index IN THE TRAINING DATASET'S tasks table."
+                )
+            task_idx = batch["task_index"].long().reshape(-1)
+            if torch.any(task_idx >= self.config.n_tasks) or torch.any(task_idx < 0):
+                # an nn.Embedding overflow on CUDA is a device-side assert with no
+                # useful message; fail here with the numbers instead
+                raise ValueError(
+                    f"task_index {task_idx.tolist()} out of range for n_tasks={self.config.n_tasks}"
+                )
+            task_features = self.task_embed(task_idx)
+            task_features = task_features.unsqueeze(1).expand(-1, n_obs_steps, -1)
+            conditioning_feats.append(task_features)
 
         combined_features = torch.cat(conditioning_feats, dim=-1)
         return combined_features.flatten(start_dim=1)

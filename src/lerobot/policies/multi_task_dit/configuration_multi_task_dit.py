@@ -83,6 +83,14 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     tokenizer_padding_side: str = "right"  # Padding side: "left" or "right"
     tokenizer_truncation: bool = True  # Whether to truncate sequences longer than max_length
 
+    # Task conditioning: "language" (default, CLIP text encoder over the per-frame
+    # instruction) or "task_index" (a learned nn.Embedding(n_tasks, hidden_dim)
+    # looked up from batch["task_index"], occupying the same conditioning-vector
+    # slot as the text features). task_index is for closed, small task sets where
+    # testing whether the policy actually parses language is not the point yet.
+    conditioning_mode: str = "language"  # "language" | "task_index"
+    n_tasks: int | None = None  # required when conditioning_mode == "task_index"
+
     # Normalization
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -150,8 +158,16 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             )
             self.image_crop_shape = None
 
-        # Text encoder validation
-        if "clip" not in self.text_encoder_name.lower():
+        # Task conditioning validation
+        if self.conditioning_mode not in ("language", "task_index"):
+            raise ValueError(
+                f"conditioning_mode must be 'language' or 'task_index', got '{self.conditioning_mode}'"
+            )
+        if self.conditioning_mode == "task_index" and not self.n_tasks:
+            raise ValueError("n_tasks must be a positive int when conditioning_mode == 'task_index'")
+
+        # Text encoder validation — only relevant when actually conditioning on language
+        if self.conditioning_mode == "language" and "clip" not in self.text_encoder_name.lower():
             raise ValueError(
                 f"text_encoder_name must be a CLIP model (contain 'clip'), got '{self.text_encoder_name}'"
             )
